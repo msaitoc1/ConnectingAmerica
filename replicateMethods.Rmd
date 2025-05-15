@@ -1,0 +1,279 @@
+---
+title: "ReplicateMethods"
+author: "Mia Callahan"
+date: "2025-05-15"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+suppressWarnings(library(reticulate))
+suppressWarnings(library(dplyr))
+library(lfe)
+suppressWarnings(library(tidyr))
+suppressWarnings(library(ggplot2))
+suppressWarnings(library(stringr))
+suppressWarnings(library(lubridate))
+suppressWarnings(library(broom))
+```
+
+```{r}
+#non parametric estimation of ATT
+ get_att<- function(df, is.Block) {
+  df <- df[df$treatment_year > 2013, ]
+  df <- df[df$treatment_year < 2020, ]
+
+  df <- df[df$Year > 2013, ]
+  df <- df[df$Year < 2020, ]
+  #define target columns based on tract or block level
+  if(is.Block) {
+    df$BlockCode <- as.factor(df$BlockCode)
+    seq_outcomes <- c("MaxAdDown", "MaxAdUp", "NumProviders")
+
+
+  } else {
+    df$TractCode <-as.factor(df$TractCode)
+    seq_outcomes <- c("employment_r", "lfpr")
+
+  }
+  
+  df$county <- as.factor(df$county)
+  df$county <- droplevels(df$county)
+  
+  #prepare one matrix per county outcome combo of dim t x g
+  dim_groups <- length(unique(df$treatment_year))
+  dim_years <- length(unique(df$Year))
+  dim_counties <- (length(unique(df$county)))
+  dim_outcomes <- length(seq_outcomes)
+  county_matrices <- array(NaN, dim=c(dim_years, dim_groups, dim_counties, dim_outcomes))
+
+
+  seq_years = 2014:2019
+  seq_groups = 2015:2019
+  seq_counties <- levels(df$county)
+
+  #add names to matrices based on groups and outcomes
+  dimnames(county_matrices) <- list(seq_years, seq_groups, seq_counties, seq_outcomes)
+
+  #prepare differences matrices
+  county_matrices_d <- county_matrices
+  if(is.Block){
+    weights <- (sapply(seq_counties, function(i) df$num_blocks[df$county == i][1]))
+
+  }else{
+    weights <- (sapply(seq_counties, function(i) df$num_tracts[df$county == i][1]))
+  }
+  #for each county, filter df to only county level
+  for(i in seq_along(seq_counties)){
+    county_level <- seq_counties[i]
+    temp_df <- df[df$county == county_level, ]
+    #for each year/cohort combo, filter to only that combo and include the mean as that entry of the matrix
+    for(t in seq_along(seq_years)){  
+      for(ty in seq_along(seq_groups)){
+        include <- (temp_df$treatment_year==(seq_groups)[ty] & temp_df$Year==(seq_years)[t])
+        for(outc in seq_along(seq_outcomes)){
+          whichcol <- colnames(temp_df) == seq_outcomes[outc]
+          county_matrices[t, ty, i, outc] <- mean(temp_df[include, whichcol], na.rm = TRUE)
+        }
+      }
+    }
+  
+  #calculate DiD
+  for(t in seq_along(seq_years)){
+    for(ty in seq_along(seq_groups)){
+      for(outc in seq_along(seq_outcomes)){
+        which_control <- length(seq_groups)
+        county_matrices_d[t, ty, i, outc] <- county_matrices[t, ty, i, outc] - county_matrices[ty, ty, i, outc] - (county_matrices[t, which_control, i, outc] - county_matrices[ty, which_control, i, outc])
+      }
+    }
+  }
+}
+  att_gt <- array(NaN, dim=c(dim_years, dim_groups, dim_outcomes))
+  dimnames(att_gt) <- list(seq_years, seq_groups, seq_outcomes)
+
+  for(t in seq_along(seq_years)){
+    for(outc in seq_along(seq_outcomes)){
+      for(ty in seq_along(seq_groups)){
+        values <- county_matrices_d[t,ty, ,outc]
+        att_gt[t,ty,outc] <- sum(values * weights, na.rm = TRUE) / sum(weights, na.rm=TRUE)
+      }
+    }
+  }
+  return(att_gt)
+ }
+```
+
+```{r}
+
+get_att_ty <- function(att_gt){
+#creates an averaged att for each group
+att_ty <- rep(NaN, length(seq_groups))  
+for(ty in seq_along(seq_groups)){
+  count <- 0
+  att_sum_ty<- 0
+  for(t in seq_along(seq_years)){
+    if(ty< t){
+      count <- count + 1
+      att_sum_ty <- att_sum_ty + att_gt[t,ty]
+
+    }
+
+  }
+  if(count == 0){
+    att_ty[ty] <- NaN
+  } else{
+  att_ty[ty] = att_sum_ty/count
+  }
+}
+att_table <- data.frame(
+  TreatmentYear = seq_groups,
+  Avg_ATT = att_ty,
+  row.names = NULL
+)
+
+
+return(att_table)
+}
+```
+
+```{r}
+#creates event study table
+get_event_study <- function(att_gt, seq_groups=2015:2019, seq_years =2014:2019){
+  event_range <- -4:4
+  att_event_time <- rep(NA, length(event_range))
+  names(att_event_time) <- as.character(event_range)
+ 
+  for (e in event_range) {
+    sum_att <- 0
+    count <- 0
+    for (ty in seq_along(seq_groups)) {
+      for (t in seq_along(seq_years)) {
+        period <- seq_years[t] - seq_groups[ty]
+        if ((period) == e) {
+          value <- att_gt[t, ty]
+          if (value != 0.00 && !is.na(value)) {
+            sum_att <- sum_att + value
+            count <- count + 1
+          }
+
+        }
+      }
+    }
+    att_event_time[as.character(e)] <- if (count > 0) sum_att / count else 0.00
+  }
+
+  # Convert to data frame
+  event_study_df <- data.frame(
+    EventTime = event_range,
+    Avg_ATT = att_event_time,
+    row.names = NULL
+  )
+
+  return(event_study_df)
+
+}
+```
+
+```{r}
+#plots event study
+plot_event_study <- function(event_study_df, title){
+  event_study_df <- event_study_df %>%
+    mutate(TreatmentPhase = ifelse(EventTime < 0, "Pre", "Post"))
+
+  max_abs_event <- max(abs(event_study_df$EventTime), na.rm = TRUE)
+  max_abs_y <- max(abs(event_study_df$Avg_ATT), na.rm = TRUE)
+
+
+  p<-ggplot(event_study_df, aes(x = EventTime, y = Avg_ATT, fill = TreatmentPhase)) +
+    geom_vline(xintercept = 0, linetype = "dotted", color = "gray40") +
+    geom_hline(yintercept = 0, linetype = "solid", color = "gray60") +
+    geom_point(size = 4, shape = 21, color = "black", stroke = 0.3) +
+    scale_fill_manual(values = c("Pre" = "tomato", "Post" = "steelblue")) +
+    scale_x_continuous(
+      limits = c(-max_abs_event, max_abs_event),
+      breaks = seq(-max_abs_event, max_abs_event)
+    ) +
+    scale_y_continuous(
+      limits = c(-max_abs_y, max_abs_y)
+    ) +
+    labs(
+      title = title,
+      x = "Years Since Treatment",
+      y = "Average ATT",
+      fill = NULL
+    ) +
+    theme_minimal(base_size = 14) +
+    theme(
+      panel.grid.major.x = element_blank(),
+      panel.grid.minor = element_blank(),
+      axis.line = element_line(color = "black"),
+      axis.ticks = element_line(color = "black"),
+      legend.position = "top",
+      plot.margin = margin(10, 20, 10, 20),
+      aspect.ratio = 0.5,
+      text = element_text(family = "CMU Serif")
+    ) 
+  return(p)
+}
+```
+
+
+```{r}
+
+#regression replication with and without controls, only works on tract level data
+df <- df.Tract
+#making variables into factors instead of numeric
+df$region <- as.factor(df$region)
+df$Year <- as.factor(df$Year)
+df$TractCode <- as.factor(df$TractCode)
+
+#defining the same control variables
+controls <- c(
+  "share_nonwhite", "share_children", "share_elderly",
+  "share_high_ed", "share_low_ed", "median_year_built",
+  "avg_household_size", "prop_renters", "lag_log_pc_income", "pop_density"
+)
+
+#initializing list of results
+results <- list()
+results_no_controls <- list()
+
+for (treat_year in 2015:2018){
+
+
+  #filter to only the year of the regression and control
+  sub <- df %>%
+    filter(treatment_year %in% c(treat_year, 2019))
+  #create numeric version of year for defining treated
+  sub$Year_num <- as.numeric(as.character(sub$Year))
+  #add a binary treated col, post col, and interaction
+  sub <- sub %>%
+     filter(!is.na(Year_num) & !is.na(treatment_year)) %>%
+    mutate(
+      treated = as.integer(treatment_year == treat_year),
+      post = as.integer(Year_num >=treatment_year),
+      did = treated*post
+    )
+    all_vars = c("employment_r", "treated", "post", "did", "Year", "county", "region", "TractCode", controls)
+    #drop nas 
+    sub <- sub %>% filter(if_all(all_of(all_vars), ~ !is.na(.)))
+
+
+    
+  
+    #Define regression formula with regional and time fixed effects and tract level clustering
+    rhs <- paste(c("treated", "post", "did", controls), collapse = "+")
+    fml <- as.formula(paste("employment_r ~", rhs, "| Year + region | 0 "))
+    fml_no_controls <- as.formula(paste("employment_r~", paste(c("treated", "post", "did"), collapse = " + "), "|Year + region | 0 "))
+
+     model <- felm(fml, data=sub)
+
+
+
+    model_no_controls <- felm(fml_no_controls, data=sub)
+
+
+    results[[treat_year]] <- model
+    results_no_controls[[treat_year]] <- model_no_controls
+}
+```
